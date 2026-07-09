@@ -2,13 +2,13 @@
 // MELTFLOOR v3 — AI eBay Listing Generator for Coins, PM & Jewelry
 // Single-file Cloudflare Worker (UI + API + metering)
 //
-// SETUP (one time, in Cloudflare dashboard):
-//   1. Settings > Variables & Secrets:
-//        ANTHROPIC_API_KEY  (secret)  — already set from v2.1
-//        ADMIN_CODE         (secret)  — any passphrase you choose
-//   2. Settings > Bindings > Add > KV Namespace:
-//        Variable name: USERS   (create a new namespace, any name)
-//   3. Edit the two constants below, then Deploy.
+// SETUP (one time, in Cloudflare dashboard > Settings > Variables & Secrets):
+//   ANTHROPIC_API_KEY  (secret)      — your Anthropic API key
+//   ACCESS_CODES       (plain text)  — comma-separated customer codes,
+//                                      e.g.  GOLD-2481, SILV-7739
+//   To add a paying customer: append a new code to ACCESS_CODES, save.
+//   To cancel one: delete it from the list, save.
+//   Then edit the two constants below and Deploy.
 // ============================================================
 
 const PAYMENT_LINK = "https://buy.stripe.com/REPLACE_ME"; // your Stripe Payment Link
@@ -25,8 +25,6 @@ export default {
       if (p === "/spot") return getSpot();
       if (p === "/quota") return getQuota(request, env);
       if (p === "/generate" && request.method === "POST") return generate(request, env);
-      if (p === "/admin") return html(PAGE_ADMIN);
-      if (p.startsWith("/admin/api") && request.method === "POST") return adminApi(request, env);
       return new Response("Not found", { status: 404 });
     } catch (e) {
       return json({ error: "Server error: " + e.message }, 500);
@@ -52,26 +50,34 @@ async function getSpot() {
   return json({ gold: au.price, silver: ag.price, ts: Date.now() });
 }
 
-// ---------- quota / access ----------
-async function checkAccess(env, anonId, code) {
+// ---------- quota / access (no-KV version) ----------
+// Paid codes live in an env variable ACCESS_CODES: comma-separated,
+// e.g.  GOLD-2481, SILV-7739
+// Add/remove codes in Cloudflare: Settings > Variables & Secrets.
+// Free quota is tracked in the visitor's browser (localStorage).
+function validCode(env, code) {
+  if (!code || !env.ACCESS_CODES) return false;
+  return env.ACCESS_CODES.split(",")
+    .map((c) => c.trim().toUpperCase())
+    .filter(Boolean)
+    .includes(code.trim().toUpperCase());
+}
+
+function checkAccess(env, used, code) {
   if (code) {
-    const rec = await env.USERS.get("code:" + code.toUpperCase(), "json");
-    if (rec && rec.active) return { ok: true, paid: true, code: code.toUpperCase(), rec };
-    return { ok: false, reason: rec ? "Access code deactivated." : "Access code not found." };
+    if (validCode(env, code)) return { ok: true, paid: true };
+    return { ok: false, reason: "Access code not found or deactivated." };
   }
-  if (!anonId) return { ok: false, reason: "Missing visitor id." };
-  const used = parseInt((await env.USERS.get("free:" + anonId)) || "0");
-  if (used >= FREE_LIMIT)
-    return { ok: false, reason: "Free limit reached.", upgrade: true, used };
-  return { ok: true, paid: false, used };
+  if ((parseInt(used) || 0) >= FREE_LIMIT)
+    return { ok: false, reason: "Free limit reached.", upgrade: true };
+  return { ok: true, paid: false };
 }
 
 async function getQuota(request, env) {
   const u = new URL(request.url);
-  const a = await checkAccess(env, u.searchParams.get("anon"), u.searchParams.get("code") || "");
-  if (a.paid) return json({ paid: true });
-  if (!a.ok && a.upgrade) return json({ paid: false, used: FREE_LIMIT, limit: FREE_LIMIT });
-  return json({ paid: false, used: a.used || 0, limit: FREE_LIMIT });
+  const code = u.searchParams.get("code") || "";
+  if (code) return json({ paid: validCode(env, code) });
+  return json({ paid: false, limit: FREE_LIMIT });
 }
 
 // ---------- generation ----------
@@ -85,9 +91,9 @@ const CATEGORY_PROMPTS = {
 
 async function generate(request, env) {
   const body = await request.json();
-  const { category, fields, photos, melt, anonId, code } = body;
+  const { category, fields, photos, melt, used, code } = body;
 
-  const access = await checkAccess(env, anonId, code);
+  const access = checkAccess(env, used, code);
   if (!access.ok) return json({ error: access.reason, upgrade: !!access.upgrade }, 402);
 
   const sys =
@@ -151,58 +157,7 @@ Respond with ONLY a JSON object, no markdown fences, no preamble, with exactly t
     return json({ error: "AI returned unparseable output — try again." }, 502);
   }
 
-  // meter AFTER success only
-  if (access.paid) {
-    access.rec.uses = (access.rec.uses || 0) + 1;
-    access.rec.last = Date.now();
-    await env.USERS.put("code:" + access.code, JSON.stringify(access.rec));
-  } else {
-    await env.USERS.put("free:" + anonId, String((access.used || 0) + 1));
-  }
-
-  return json({
-    listing,
-    quota: access.paid ? null : { used: (access.used || 0) + 1, limit: FREE_LIMIT },
-  });
-}
-
-// ---------- admin ----------
-async function adminApi(request, env) {
-  const { adminCode, action, code, note } = await request.json();
-  if (!env.ADMIN_CODE || adminCode !== env.ADMIN_CODE)
-    return json({ error: "Wrong admin code." }, 403);
-
-  if (action === "create") {
-    const newCode = Array.from(crypto.getRandomValues(new Uint8Array(4)))
-      .map((b) => "ABCDEFGHJKMNPQRSTUVWXYZ23456789"[b % 31])
-      .join("") + "-" +
-      Array.from(crypto.getRandomValues(new Uint8Array(4)))
-      .map((b) => "ABCDEFGHJKMNPQRSTUVWXYZ23456789"[b % 31])
-      .join("");
-    await env.USERS.put(
-      "code:" + newCode,
-      JSON.stringify({ active: true, created: Date.now(), uses: 0, note: note || "" })
-    );
-    return json({ code: newCode });
-  }
-  if (action === "list") {
-    const list = await env.USERS.list({ prefix: "code:" });
-    const out = [];
-    for (const k of list.keys) {
-      const rec = await env.USERS.get(k.name, "json");
-      out.push({ code: k.name.slice(5), ...rec });
-    }
-    return json({ codes: out.sort((a, b) => b.created - a.created) });
-  }
-  if (action === "toggle") {
-    const key = "code:" + code.toUpperCase();
-    const rec = await env.USERS.get(key, "json");
-    if (!rec) return json({ error: "Code not found." }, 404);
-    rec.active = !rec.active;
-    await env.USERS.put(key, JSON.stringify(rec));
-    return json({ code, active: rec.active });
-  }
-  return json({ error: "Unknown action." }, 400);
+  return json({ listing, paid: access.paid });
 }
 
 // ============================================================
@@ -360,7 +315,7 @@ const PAGE_APP = `<!doctype html><html lang="en"><head>
 const FIELDS=${JSON.stringify(CATEGORY_FIELDS)};
 const $=(id)=>document.getElementById(id);
 let cat="coins", photos=[], spot={gold:0,silver:0};
-let anon=localStorage.mf_anon||(localStorage.mf_anon=crypto.randomUUID());
+let used=parseInt(localStorage.mf_used||"0");
 let code=localStorage.mf_code||"";
 
 // tabs
@@ -406,11 +361,11 @@ $("photoIn").addEventListener("change",async e=>{
     img.src="data:"+f.type+";base64,"+data;$("photoPrev").appendChild(img);}});
 
 // quota display
-function showQuota(q){
+const LIMIT=${FREE_LIMIT};
+function showQuota(){
   $("quota").innerHTML=code?'<b>PRO</b> · unlimited'
-    :(q?('<b>'+(q.limit-q.used)+'</b> of '+q.limit+' free listings left'):'');}
-fetch("/quota?anon="+anon+(code?"&code="+code:"")).then(r=>r.json())
-  .then(q=>showQuota(q.paid?null:q)).catch(()=>{});
+    :'<b>'+Math.max(0,LIMIT-used)+'</b> of '+LIMIT+' free listings left';}
+showQuota();
 
 // generate
 $("go").onclick=async()=>{
@@ -420,13 +375,15 @@ $("go").onclick=async()=>{
   try{
     const r=await fetch("/generate",{method:"POST",
       headers:{"content-type":"application/json"},
-      body:JSON.stringify({category:cat,fields,photos,melt:melt(),anonId:anon,code})});
+      body:JSON.stringify({category:cat,fields,photos,melt:melt(),used,code})});
     const d=await r.json();
     if(d.error){
       if(d.upgrade)$("modal").style.display="flex";
       else $("out").innerHTML='<div class="err">'+d.error+'</div>';
       return;}
-    render(d.listing);if(d.quota)showQuota(d.quota);
+    render(d.listing);
+    if(!code){used++;localStorage.mf_used=used;}
+    showQuota();
     saveHist(d.listing);
   }catch(e){$("out").innerHTML='<div class="err">Network error — try again.</div>';}
   finally{$("go").disabled=false;$("go").textContent="GENERATE LISTING";}};
@@ -471,38 +428,7 @@ $("codeLink").onclick=(e)=>{e.preventDefault();$("modal").style.display="flex";}
 $("modalClose").onclick=()=>$("modal").style.display="none";
 $("codeSave").onclick=async()=>{
   const c=$("codeIn").value.trim().toUpperCase();if(!c)return;
-  const q=await fetch("/quota?anon="+anon+"&code="+c).then(r=>r.json());
-  if(q.paid){code=c;localStorage.mf_code=c;$("modal").style.display="none";showQuota(null);}
+  const q=await fetch("/quota?code="+encodeURIComponent(c)).then(r=>r.json());
+  if(q.paid){code=c;localStorage.mf_code=c;$("modal").style.display="none";showQuota();}
   else alert("Code not recognized — check for typos or email ${SUPPORT_EMAIL}.");};
 </script></body></html>`;
-
-// ============================================================
-// FRONTEND — admin page  (yourworker.dev/admin)
-// ============================================================
-const PAGE_ADMIN = `<!doctype html><html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${BRAND} admin</title><style>${CSS}</style></head><body><div class="wrap">
-<h1>ADMIN</h1>
-<label>Admin code</label><input id="ac" type="password">
-<label>Note for new code (customer email)</label><input id="note" placeholder="buyer@email.com">
-<div class="row" style="margin-top:14px">
-<button class="ghost" id="mk" style="flex:1">Create access code</button>
-<button class="ghost" id="ls" style="flex:1">List codes</button></div>
-<div id="out"></div>
-<script>
-const $=(i)=>document.getElementById(i);
-async function api(b){const r=await fetch("/admin/api",{method:"POST",
-  headers:{"content-type":"application/json"},
-  body:JSON.stringify({adminCode:$("ac").value,...b})});return r.json();}
-$("mk").onclick=async()=>{const d=await api({action:"create",note:$("note").value});
-  $("out").innerHTML=d.error?'<div class="err">'+d.error+'</div>'
-  :'<div class="card"><h3>New code</h3><div class="val price">'+d.code+'</div></div>';};
-$("ls").onclick=async()=>{const d=await api({action:"list"});
-  if(d.error){$("out").innerHTML='<div class="err">'+d.error+'</div>';return;}
-  $("out").innerHTML=d.codes.map(c=>
-   '<div class="card"><h3>'+c.code+(c.active?' · ACTIVE':' · OFF')+
-   '<button class="copy" onclick="tg(\\''+c.code+'\\')">TOGGLE</button></h3>'+
-   '<div class="val">'+(c.note||"")+' · '+(c.uses||0)+' uses · '+
-   new Date(c.created).toLocaleDateString()+'</div></div>').join("")||"No codes yet.";};
-window.tg=async(c)=>{await api({action:"toggle",code:c});$("ls").click();};
-</script></div></body></html>`;
