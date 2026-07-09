@@ -12,7 +12,7 @@
 // ============================================================
 
 const PAYMENT_LINK = "https://buy.stripe.com/REPLACE_ME"; // your Stripe Payment Link
-const SUPPORT_EMAIL = "REPLACE@ME.com";                    // where buyers reach you
+const SUPPORT_EMAIL = "jamesacrocker@gmail.com";                    // where buyers reach you
 const FREE_LIMIT = 5;                                      // free listings per visitor
 const BRAND = "MeltFloor";
 
